@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.out
+*.exe
+main
+
+# Environment files
+.env
+
+# Editor/IDE directories
+.vscode/
+.idea/
+*.swp
+*~
+*.DS_Store
+
+# Logs
+*.log
+
+# Generated schema and migration files
+tables/
