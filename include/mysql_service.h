@@ -4,6 +4,7 @@
 #include <mysql/mysql.h>
 #include <time.h>
 #include <pthread.h>
+#include "app_context.h"
 
 typedef struct {
     char *host;
@@ -39,6 +40,6 @@ void free_config(DBConfig *config);
 MYSQL* connect_db(DBConfig *config);
 void test_connection(MYSQL *conn);
 void close_connection(MYSQL *conn);
-void track_changes(MYSQL *conn, DBConfig *config);
-void watch_database(DBConfig *config);
+void track_changes(MYSQL *conn, DBConfig *config, AppContext *ctx);
+void watch_database(DBConfig *config, AppContext *ctx);
 #endif // MYSQL_SERVICE_H

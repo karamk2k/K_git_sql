@@ -1,5 +1,6 @@
 # Build artifacts
 build/
+build/*.pid
 *.o
 *.a
 *.so
@@ -19,6 +20,8 @@ main
 
 # Logs
 *.log
+logs/
 
 # Generated schema and migration files
 tables/
+dbtables/

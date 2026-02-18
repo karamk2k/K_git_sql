@@ -1,16 +1,19 @@
-# MySQL Schema Watcher
-
-A C-based utility that monitors a MySQL database for schema changes and automatically generates migration files (up/down) and tracks history.
+# MySQL + Git Watcher
 
 ## Features
 
-- **Continuous Monitoring**: Runs as a daemon/watcher process to check for schema changes every minute .
-- **Schema Snapshotting**: Saves the current `CREATE TABLE` schema for all tables in `tables/<table_name>/schema.sql`.
+- **Continuous Monitoring**: Runs long-lived watcher threads for Git and MySQL.
+- **Git Branch Tracking**: Detects current branch and branch switches.
+- **Schema Snapshotting**: Saves normalized schema snapshots in `tables/<table_name>/schema.sql`.
 - **Automatic Migrations**:
     - Detects added columns and generates `ALTER TABLE ... ADD ...` statements.
     - Detects removed columns and generates `ALTER TABLE ... DROP ...` statements.
     - Creates timestamped `_up.sql` and `_down.sql` migration files.
-- **History Tracking**: Logs all modifications in `tables/<table_name>/history.txt`.
+- **Branch-Aware SQL Output**:
+    - `main` branch: writes baseline snapshots under `dbtables/main/schemas/` and full snapshot file `dbtables/main.sql`.
+    - Non-`main` branches: writes delta pairs using timestamp style `dbtables/<branch>/<timestamp>_<table>_up.sql` and `_down.sql`.
+- **History Tracking**: Logs schema modifications in `tables/<table_name>/history.txt`.
+- **App Logging**: Writes runtime logs to `logs/app.log`.
 - **Environment Configuration**: Loads database credentials directly from a `.env` file.
 
 ## Prerequisites
@@ -49,32 +52,55 @@ make
 ```
 This creates the executable at `build/main`.
 
-### Run
-To build and run the watcher:
+### Run Foreground
+To build and run in foreground:
 ```bash
 make run
 ```
 
-The program will start, connect to the database, and enter a loop watching for changes.
+### Run Background
+To run as background process:
+```bash
+make run-d
+```
+To stop:
+```bash
+make stop-d
+```
+
+The program connects to the DB, starts Git/MySQL watcher threads, and keeps monitoring.
 Output will look like:
 ```
 DB Host: 127.0.0.1
 ...
 Connection test successful!
 Starting database watcher for mydb...
+Current branch: main
 ```
 
 ### Files Generated
-When a change is detected (e.g., adding a column to `test_table`), the following structure is created:
+When changes are detected, files are generated like:
 
 ```
 tables/
 └── test_table/
-    ├── schema.sql              # Current full schema
-    ├── history.txt             # Log of changes
+    ├── schema.sql
+    ├── history.txt
     └── migrations/
-        ├── 20231027100000_test_table_up.sql   # ALTER TABLE ... ADD column ...
-        └── 20231027100000_test_table_down.sql # ALTER TABLE ... DROP column ...
+        ├── 20231027100000_test_table_up.sql
+        └── 20231027100000_test_table_down.sql
+
+dbtables/
+├── main.sql
+├── main/
+│   └── schemas/
+│       └── <table>.sql
+└── <non-main-branch>/
+    ├── 20231027100000_test_table_up.sql
+    └── 20231027100000_test_table_down.sql
+
+logs/
+└── app.log
 ```
 
 ## Cleaning Build

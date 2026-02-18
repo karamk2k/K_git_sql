@@ -12,6 +12,78 @@
 
 #define MAX_LINE_LENGTH 1024
 #define MAX_QUERY_LENGTH 2048
+#define NAME_SIZE 256
+
+typedef struct EmittedChange {
+    char branch[NAME_SIZE];
+    char table[NAME_SIZE];
+    char *schema;
+    struct EmittedChange *next;
+} EmittedChange;
+
+static EmittedChange *g_emitted_changes = NULL;
+
+static int has_emitted_change(const char *branch, const char *table, const char *schema) {
+    EmittedChange *node = g_emitted_changes;
+    while (node) {
+        if (strcmp(node->branch, branch) == 0 &&
+            strcmp(node->table, table) == 0 &&
+            strcmp(node->schema, schema) == 0) {
+            return 1;
+        }
+        node = node->next;
+    }
+    return 0;
+}
+
+static void set_emitted_change(const char *branch, const char *table, const char *schema) {
+    EmittedChange *node = g_emitted_changes;
+    while (node) {
+        if (strcmp(node->branch, branch) == 0 &&
+            strcmp(node->table, table) == 0) {
+            free(node->schema);
+            node->schema = strdup(schema);
+            return;
+        }
+        node = node->next;
+    }
+
+    EmittedChange *new_node = malloc(sizeof(EmittedChange));
+    if (!new_node) {
+        return;
+    }
+    snprintf(new_node->branch, sizeof(new_node->branch), "%s", branch);
+    snprintf(new_node->table, sizeof(new_node->table), "%s", table);
+    new_node->schema = strdup(schema);
+    new_node->next = g_emitted_changes;
+    g_emitted_changes = new_node;
+}
+
+static void clear_emitted_change(const char *branch, const char *table) {
+    EmittedChange **cursor = &g_emitted_changes;
+    while (*cursor) {
+        EmittedChange *node = *cursor;
+        if (strcmp(node->branch, branch) == 0 &&
+            strcmp(node->table, table) == 0) {
+            *cursor = node->next;
+            free(node->schema);
+            free(node);
+            return;
+        }
+        cursor = &((*cursor)->next);
+    }
+}
+
+static int should_stop(AppContext *ctx) {
+    int stop = 0;
+    if (!ctx) {
+        return 0;
+    }
+    pthread_mutex_lock(&ctx->lock);
+    stop = ctx->stop;
+    pthread_mutex_unlock(&ctx->lock);
+    return stop;
+}
 
 // Helper functions (static to this file)
 static void create_directory(const char *path) {
@@ -108,6 +180,98 @@ static void save_sql_file(const char *path, const char *content) {
     } else {
         perror("Failed to write SQL file");
     }
+}
+
+static char *normalize_schema(const char *schema) {
+    if (!schema) {
+        return NULL;
+    }
+
+    size_t len = strlen(schema);
+    char *out = malloc(len + 1);
+    if (!out) {
+        return NULL;
+    }
+
+    size_t i = 0;
+    size_t j = 0;
+    const char *token = "AUTO_INCREMENT=";
+    size_t token_len = strlen(token);
+
+    while (i < len) {
+        if (i + token_len <= len && strncmp(&schema[i], token, token_len) == 0) {
+            i += token_len;
+            while (i < len && isdigit((unsigned char)schema[i])) {
+                i++;
+            }
+            continue;
+        }
+        out[j++] = schema[i++];
+    }
+
+    out[j] = '\0';
+    return out;
+}
+
+static void sanitize_name(const char *in, char *out, size_t out_size) {
+    size_t i = 0;
+    if (!in || out_size == 0) {
+        return;
+    }
+
+    for (; in[i] && i < out_size - 1; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (isalnum(c) || c == '_' || c == '-' || c == '.') {
+            out[i] = (char)c;
+        } else {
+            out[i] = '_';
+        }
+    }
+    out[i] = '\0';
+}
+
+static void write_table_block(FILE *fp, const char *branch, const char *table_name, const char *schema) {
+    if (!fp) {
+        return;
+    }
+    fprintf(fp, "-- branch: %s | table: %s\n", branch, table_name);
+    fprintf(fp, "%s;\n\n", schema);
+}
+
+static char *read_file_content(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        return NULL;
+    }
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    long len = ftell(fp);
+    if (len < 0) {
+        fclose(fp);
+        return NULL;
+    }
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+
+    char *buf = malloc((size_t)len + 1);
+    if (!buf) {
+        fclose(fp);
+        return NULL;
+    }
+
+    size_t n = fread(buf, 1, (size_t)len, fp);
+    fclose(fp);
+    if (n != (size_t)len) {
+        free(buf);
+        return NULL;
+    }
+    buf[len] = '\0';
+    return buf;
 }
 
 static void generate_alter_statements(const char *table_name, const char *old_schema, const char *new_schema, char *up_sql, char *down_sql) {
@@ -261,15 +425,21 @@ static void save_schema_and_check_diff(const char *table_dir, const char *table_
         fclose(fp);
     }
 
+    char *existing_normalized = normalize_schema(existing_schema);
+    char *schema_normalized = normalize_schema(schema);
+
     // Compare and save if different
-    if (!existing_schema || strcmp(existing_schema, schema) != 0) {
+    if (!existing_normalized || !schema_normalized ||
+        strcmp(existing_normalized, schema_normalized) != 0) {
         printf("Change detected in table: %s\n", table_name);
 
         // Generate migrations
-        generate_migrations(table_dir, table_name, existing_schema, schema);
+        generate_migrations(table_dir, table_name, existing_normalized, schema_normalized);
 
         // Save new schema
-        save_sql_file(schema_path, schema);
+        if (schema_normalized) {
+            save_sql_file(schema_path, schema_normalized);
+        }
 
         // Log to history
         fp = fopen(history_path, "a");
@@ -279,7 +449,7 @@ static void save_schema_and_check_diff(const char *table_dir, const char *table_
             timestamp[strcspn(timestamp, "\n")] = 0; // Remove newline
             
             fprintf(fp, "[%s] Schema changed\n", timestamp);
-            if (existing_schema) {
+            if (existing_normalized) {
                 fprintf(fp, "Previous schema was different. Generated ALTER statements.\n");
             } else {
                 fprintf(fp, "Initial schema saved.\n");
@@ -290,6 +460,8 @@ static void save_schema_and_check_diff(const char *table_dir, const char *table_
     }
 
     if (existing_schema) free(existing_schema);
+    if (existing_normalized) free(existing_normalized);
+    if (schema_normalized) free(schema_normalized);
 }
 
 int load_config(DBConfig *config) {
@@ -353,20 +525,65 @@ void close_connection(MYSQL *conn) {
     mysql_close(conn);
 }
 
-void track_changes(MYSQL *conn, DBConfig *config) {
+void track_changes(MYSQL *conn, DBConfig *config, AppContext *ctx) {
     // Ensure 'tables' directory exists
     create_directory("tables");
+    create_directory("dbtables");
+
+    char branch_name[NAME_SIZE];
+    char branch_key[NAME_SIZE];
+    app_get_branch(ctx, branch_name, sizeof(branch_name));
+    sanitize_name(branch_name, branch_key, sizeof(branch_key));
+    if (branch_key[0] == '\0') {
+        snprintf(branch_key, sizeof(branch_key), "%s", "unknown");
+    }
+    int is_main_branch = strcmp(branch_key, "main") == 0;
+
+    char branch_dir[512];
+    char main_branch_dir[512];
+    char main_schemas_dir[512];
+    char main_tables_path[512];
+    char branch_init_path[512];
+    snprintf(branch_dir, sizeof(branch_dir), "dbtables/%s", branch_key);
+    snprintf(main_branch_dir, sizeof(main_branch_dir), "dbtables/main");
+    snprintf(main_schemas_dir, sizeof(main_schemas_dir), "%s/schemas", main_branch_dir);
+    snprintf(main_tables_path, sizeof(main_tables_path), "dbtables/main.sql");
+    snprintf(branch_init_path, sizeof(branch_init_path), "%s/.initialized", branch_dir);
+
+    create_directory(branch_dir);
+    if (is_main_branch) {
+        create_directory(main_branch_dir);
+        create_directory(main_schemas_dir);
+    }
+    int is_branch_bootstrap = is_main_branch && (access(branch_init_path, F_OK) != 0);
+
+    FILE *main_fp = NULL;
+    if (is_main_branch) {
+        main_fp = fopen(main_tables_path, "w");
+    }
+    if (main_fp) {
+        fprintf(main_fp, "-- all tables snapshot\n");
+        fprintf(main_fp, "-- branch: %s\n\n", branch_name);
+    }
 
     char query[MAX_QUERY_LENGTH];
     snprintf(query, sizeof(query), "SELECT table_name FROM information_schema.tables WHERE table_schema = '%s'", config->name);
 
     if (mysql_query(conn, query)) {
         fprintf(stderr, "Failed to fetch tables: %s\n", mysql_error(conn));
+        if (main_fp) {
+            fclose(main_fp);
+        }
         return;
     }
 
     MYSQL_RES *result = mysql_store_result(conn);
-    if (!result) return;
+    if (!result) {
+        if (main_fp) {
+            fclose(main_fp);
+        }
+        return;
+    }
 
     MYSQL_ROW row;
     while ((row = mysql_fetch_row(result))) {
@@ -375,23 +592,100 @@ void track_changes(MYSQL *conn, DBConfig *config) {
         char table_dir[512];
         snprintf(table_dir, sizeof(table_dir), "tables/%s", table_name);
         create_directory(table_dir);
+        
+        char safe_table_name[NAME_SIZE];
+        sanitize_name(table_name, safe_table_name, sizeof(safe_table_name));
 
         char *schema = get_table_schema(conn, table_name);
         if (schema) {
+            char *schema_normalized = normalize_schema(schema);
+
             save_schema_and_check_diff(table_dir, table_name, schema);
+
+            if (schema_normalized) {
+                if (is_main_branch) {
+                    char main_schema_path[512];
+                    snprintf(main_schema_path, sizeof(main_schema_path), "%s/%s.sql", main_schemas_dir, safe_table_name);
+                    save_sql_file(main_schema_path, schema_normalized);
+                    write_table_block(main_fp, branch_name, table_name, schema_normalized);
+                } else {
+                    char main_schema_path[512];
+                    snprintf(main_schema_path, sizeof(main_schema_path), "%s/%s.sql", main_schemas_dir, safe_table_name);
+                    char *main_schema = read_file_content(main_schema_path);
+                    char *main_schema_norm = normalize_schema(main_schema);
+                    int differs_from_main = (!main_schema_norm) || (strcmp(main_schema_norm, schema_normalized) != 0);
+
+                    if (differs_from_main && !has_emitted_change(branch_key, safe_table_name, schema_normalized)) {
+                        char up_sql[8192];
+                        char down_sql[1024];
+                        const char *reason = "branch_delta";
+                        if (!main_schema_norm) {
+                            snprintf(up_sql, sizeof(up_sql), "-- table: %s | reason: new_table\n%s;\n\n", table_name, schema_normalized);
+                            snprintf(down_sql, sizeof(down_sql), "-- table: %s | reason: rollback_new_table\nDROP TABLE IF EXISTS `%s`;\n\n", table_name, table_name);
+                            reason = "new_table";
+                        } else {
+                            up_sql[0] = '\0';
+                            down_sql[0] = '\0';
+                            generate_alter_statements(table_name, main_schema_norm, schema_normalized, up_sql, down_sql);
+                            reason = "schema_changed";
+                        }
+                        if (strlen(up_sql) > 0 || strlen(down_sql) > 0) {
+                            time_t now = time(NULL);
+                            struct tm tm_now;
+                            char ts[32];
+                            localtime_r(&now, &tm_now);
+                            strftime(ts, sizeof(ts), "%Y%m%d%H%M%S", &tm_now);
+
+                            char up_event_path[512];
+                            char down_event_path[512];
+                            snprintf(up_event_path, sizeof(up_event_path), "%s/%s_%s_up.sql", branch_dir, ts, safe_table_name);
+                            snprintf(down_event_path, sizeof(down_event_path), "%s/%s_%s_down.sql", branch_dir, ts, safe_table_name);
+
+                            char up_file_content[8448];
+                            char down_file_content[8448];
+                            snprintf(up_file_content, sizeof(up_file_content), "-- table: %s | reason: %s\n%s", table_name, reason, up_sql);
+                            snprintf(down_file_content, sizeof(down_file_content), "-- table: %s | reason: %s\n%s", table_name, reason, down_sql);
+
+                            save_sql_file(up_event_path, up_file_content);
+                            save_sql_file(down_event_path, down_file_content);
+                        }
+                        set_emitted_change(branch_key, safe_table_name, schema_normalized);
+                        app_log(ctx, "MySQL: branch delta for %s -> %s", branch_name, table_name);
+                    } else if (!differs_from_main) {
+                        clear_emitted_change(branch_key, safe_table_name);
+                    }
+
+                    if (main_schema_norm) {
+                        free(main_schema_norm);
+                    }
+                    if (main_schema) {
+                        free(main_schema);
+                    }
+                }
+
+                free(schema_normalized);
+            }
             free(schema);
         }
     }
 
     mysql_free_result(result);
+    if (main_fp) {
+        fclose(main_fp);
+    }
+    if (is_main_branch && is_branch_bootstrap) {
+        save_sql_file(branch_init_path, "initialized\n");
+        app_log(ctx, "MySQL: initialized branch baseline for %s", branch_name);
+    }
 }
 
-void watch_database(DBConfig *config) {
+void watch_database(DBConfig *config, AppContext *ctx) {
     printf("Starting database watcher for %s...\n", config->name);
-    while (1) {
+    app_log(ctx, "MySQL: watcher started for database %s", config->name);
+    while (!should_stop(ctx)) {
         MYSQL *conn = connect_db(config);
         if (conn) {
-            track_changes(conn, config);
+            track_changes(conn, config, ctx);
             close_connection(conn);
         } else {
             fprintf(stderr, "Retrying connection in 5 seconds...\n");
